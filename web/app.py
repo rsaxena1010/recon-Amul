@@ -267,11 +267,11 @@ def _upload_bar(loaded, as_of_str):
             f'{_CONVERT_JS}')
 
 
-# Browser-side: if a .parquet file is chosen, parse it with the vendored hyparquet
-# bundle and convert to CSV before upload (the server is pure-stdlib and can't read
-# parquet). CSV files upload unchanged.
+# Browser-side: if a .parquet file is chosen, parse it (pure-JS hyparquet) and
+# convert to CSV before upload — the server is pure-stdlib and can't read parquet.
+# The reader is loaded from the self-hosted bundle if present (/static/parquet.min.js,
+# baked in by a local CLI build), else from the jsdelivr CDN. CSV uploads unchanged.
 _CONVERT_JS = """
-<script src="/static/parquet.min.js"></script>
 <script>
 (function(){
   var form=document.getElementById('upForm'); if(!form) return;
@@ -290,24 +290,35 @@ _CONVERT_JS = """
     for(var i=0;i<rows.length;i++){var r=rows[i],line=[];for(var j=0;j<cols.length;j++)line.push(esc(r[cols[j]]));out.push(line.join(','));}
     return out.join('\\n');
   }
+  function loadScript(src){return new Promise(function(res,rej){var s=document.createElement('script');s.src=src;s.onload=res;s.onerror=function(){rej(new Error('load failed'));};document.head.appendChild(s);});}
+  function getReader(){
+    if(window.HyParquet&&window.HyParquet.parquetReadObjects) return Promise.resolve(window.HyParquet.parquetReadObjects);
+    return loadScript('/static/parquet.min.js').then(function(){
+      if(window.HyParquet&&window.HyParquet.parquetReadObjects) return window.HyParquet.parquetReadObjects;
+      throw new Error('no global');
+    }).catch(function(){
+      return import('https://cdn.jsdelivr.net/npm/hyparquet@1.26.2/+esm').then(function(m){return m.parquetReadObjects;});
+    });
+  }
   form.addEventListener('submit', function(ev){
     var f=fileEl.files[0]; if(!f) return;
     var name=f.name.toLowerCase();
     if(!(name.endsWith('.parquet')||name.endsWith('.pq'))) return;  // CSV: normal submit
     ev.preventDefault();
-    msg.textContent='Converting parquet…';
-    f.arrayBuffer().then(function(ab){
-      return HyParquet.parquetReadObjects({file:ab});
-    }).then(function(rows){
-      var csv=toCSV(rows);
-      var fd=new FormData();
-      fd.append('file', new Blob([csv],{type:'text/csv'}), 'converted.csv');
-      fd.append('as_of', document.getElementById('upAsOf').value||'');
-      msg.textContent='Uploading '+rows.length.toLocaleString()+' rows…';
-      return fetch('/upload',{method:'POST',body:fd});
-    }).then(function(){
-      window.location.assign('/?as_of='+encodeURIComponent(document.getElementById('upAsOf').value||''));
-    }).catch(function(e){ msg.textContent='Parquet error: '+e.message; });
+    msg.textContent='Loading parquet reader…';
+    var reader;
+    getReader().then(function(fn){reader=fn;msg.textContent='Converting parquet…';return f.arrayBuffer();})
+      .then(function(ab){return reader({file:ab});})
+      .then(function(rows){
+        var csv=toCSV(rows);
+        var fd=new FormData();
+        fd.append('file', new Blob([csv],{type:'text/csv'}), 'converted.csv');
+        fd.append('as_of', document.getElementById('upAsOf').value||'');
+        msg.textContent='Uploading '+rows.length.toLocaleString()+' rows…';
+        return fetch('/upload',{method:'POST',body:fd});
+      })
+      .then(function(){window.location.assign('/?as_of='+encodeURIComponent(document.getElementById('upAsOf').value||''));})
+      .catch(function(e){msg.textContent='Parquet error: '+e.message+' — try uploading the CSV export instead.';});
   });
 })();
 </script>
