@@ -104,6 +104,31 @@ section 12 calls `build(OUT_FILE, DASH_FILE)`. Sections:
 - GPOS rows currently absent — dashboard reflects HPTech only until the GPOS query returns
   data. It auto-adapts (shows both sources) once GPOS lands.
 
+## Hosted app (Blinkit Apps)
+
+- **Project:** `amul-recon` · **URL:** https://related-monster.apps.blinkit.in
+  (internal Blinkit Apps platform, gated by the org gateway — not a public link).
+- **Deploy path:** MCP pipeline (`init_project → upload_files → deploy`); no local
+  `chef` CLI in this environment. Files live under `web/`, `skaffold.yaml`, `k8s/`.
+- **Pure standard library — no pip.** The build cluster's pip proxy is broken
+  (package downloads time out; index host malformed with `%20`), so ANY `pip install`
+  fails. The deployable therefore uses only CPython stdlib:
+  - `web/app.py` — `http.server` + `csv` (no Flask/pandas). Upload the **CSV** export,
+    dashboard renders; last upload persists (emptyDir) until pod restart. `?as_of=`
+    drives the overdue calc.
+  - `web/render.py` — dependency-free presentation (SVG/tables/page), shared with the
+    notebook path.
+  - `web/dashboard_core.py` — pandas compute for the notebook static export; delegates
+    visuals to `render.assemble`. NOT copied into the container (needs pandas).
+  - `web/Dockerfile` — `python:3.11-slim`, copies `render.py app.py`, runs `python app.py`.
+- **Input:** CSV only in the app (parquet needs pyarrow, uninstallable here). The
+  notebook writes `amul_invoice_extract.csv` — upload that.
+- **Redeploy:** edit files → `upload_files` (changed files) → `deploy` → poll
+  `deploy_status`. k8s: Deployment+Service both named `amul-recon`, port 8080, 1 replica.
+- **Known platform bug (reported/for reporting):** build-time pip index URL is two
+  hosts joined by a space (`sfw.ai-artifacts.blinkit.in%20sfw.socket-firewall...`),
+  so pip can't fetch wheels. Worked around by removing all pip deps.
+
 ## Git
 
 - Branch: `claude/redash-data-consolidation-5mp9wu`
@@ -121,3 +146,8 @@ section 12 calls `build(OUT_FILE, DASH_FILE)`. Sections:
   payments due vs held). Analysis of the June-2025 HPTech extract: PO ₹143.2 Cr,
   Invoice ₹104.2 Cr, GRN ₹105.4 Cr, DN ₹0.66 Cr; 83 discrepant lines (all
   excess-received); 10 invoices with no payment recorded.
+- 2026-07-06 — Added Amul 1-day credit term → due-date, overdue flag, payables
+  aging. Built + deployed the hosted app `amul-recon` on Blinkit Apps
+  (https://related-monster.apps.blinkit.in). Refactored to pure-stdlib (no pip)
+  after the build cluster's pip proxy proved unusable; presentation shared via
+  `web/render.py`. App takes the CSV export.
