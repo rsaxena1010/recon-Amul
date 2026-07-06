@@ -1,5 +1,9 @@
-flask==3.0.3
-gunicorn==22.0.0
-pandas==2.2.2
-pyarrow==16.1.0
-numpy==1.26.4
+# No third-party dependencies.
+#
+# The hosted app (app.py) is pure Python standard library on purpose: the Blinkit
+# Apps build cluster's pip package proxy cannot deliver wheels, so any `pip install`
+# fails. The Dockerfile therefore does NOT run pip.
+#
+# The notebook path (dashboard_core.py) DOES use pandas/numpy/pyarrow — install
+# those in your notebook/Jupyter environment, not in this container:
+#   pandas  numpy  pyarrow

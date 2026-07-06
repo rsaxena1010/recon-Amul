@@ -1,154 +1,386 @@
 #!/usr/bin/env python3
 """
-Amul Reconciliation web app.
+Amul Reconciliation web app — pure Python standard library (no third-party deps),
+so the container image needs zero `pip install` (the build cluster's package proxy
+is broken). Upload the consolidated CSV export and get the reconciliation
+dashboard; the last upload persists across refreshes until the pod restarts.
 
-Upload a consolidated extract (parquet or csv, in the same format the notebook
-produces), and get the reconciliation dashboard. The last uploaded file is kept
-so the analysis persists across refreshes (until the pod restarts). Change the
-"as of" date to drive the credit-day / overdue calculation.
+Reads CSV (the notebook's amul_invoice_extract.csv). Parquet needs pyarrow, which
+can't be installed in this build environment, so CSV is the supported input.
 """
 import os
-import traceback
-import pandas as pd
-from flask import Flask, request, redirect, send_file, Response
+import csv
+import io
+import cgi
+import datetime as dt
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
 
-import dashboard_core as core
-
-app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 300 * 1024 * 1024  # 300 MB uploads
+import render as R
 
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 os.makedirs(DATA_DIR, exist_ok=True)
-ALLOWED = {".parquet", ".pq", ".csv", ".txt"}
+CURRENT = os.path.join(DATA_DIR, "current.csv")
+MAX_BYTES = 400 * 1024 * 1024
+
+NUM_COLS = ("po_quantity", "po_landing_price", "invoice_quantity",
+            "invoice_landing_price", "grn_quantity", "grn_landing_price",
+            "dn_quantity", "net_amount", "total_payment_value")
 
 
-def _current_file():
-    if not os.path.isdir(DATA_DIR):
+# --------------------------------------------------------------- parsing -----
+def _f(x):
+    if x is None:
         return None
-    files = [os.path.join(DATA_DIR, f) for f in os.listdir(DATA_DIR)
-             if os.path.splitext(f)[1].lower() in ALLOWED and not f.startswith(".")]
-    if not files:
+    x = str(x).strip()
+    if x == "" or x.lower() in ("nan", "none", "null"):
         return None
-    return max(files, key=os.path.getmtime)
-
-
-def _upload_bar(current_name, as_of_str):
-    cur = (f'<span style="color:var(--muted)">Loaded: <b style="color:var(--ink)">'
-           f'{core.esc(current_name)}</b></span>' if current_name
-           else '<span style="color:var(--muted)">No file loaded yet.</span>')
-    dl = ('<a class="btn ghost" href="/download">Download source</a>' if current_name else '')
-    return f"""
-<div class="uploadbar">
-  <form method="post" action="/upload" enctype="multipart/form-data">
-    <input type="file" name="file" accept=".parquet,.pq,.csv,.txt" required>
-    <input type="date" name="as_of" value="{as_of_str}" title="As-of date for overdue calc">
-    <button class="btn" type="submit">Upload &amp; analyse</button>
-  </form>
-  <form method="get" action="/">
-    <input type="hidden" name="_" value="1">
-    <button class="btn ghost" type="submit">Refresh</button>
-  </form>
-  {dl}
-  {cur}
-</div>"""
-
-
-def _as_of(default=None):
-    raw = request.values.get("as_of", "").strip()
-    if raw:
-        try:
-            return pd.Timestamp(raw).normalize()
-        except Exception:
-            pass
-    return default or pd.Timestamp.today().normalize()
-
-
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-
-@app.get("/")
-def index():
-    path = _current_file()
-    as_of = _as_of()
-    as_of_str = as_of.strftime("%Y-%m-%d")
-    if not path:
-        bar = _upload_bar(None, as_of_str)
-        return Response(_landing(bar), mimetype="text/html")
     try:
-        df = core.read_any(path)
-        bar = _upload_bar(os.path.basename(path), as_of_str)
-        html = core.render_page(df, as_of, upload_html=bar,
-                                data_note=f"file: {os.path.basename(path)}")
-        return Response(html, mimetype="text/html")
-    except Exception:
-        return Response(_error(traceback.format_exc()), mimetype="text/html", status=500)
+        return float(x)
+    except ValueError:
+        return None
 
 
-@app.post("/upload")
-def upload():
-    f = request.files.get("file")
-    if not f or not f.filename:
-        return redirect("/")
-    ext = os.path.splitext(f.filename)[1].lower()
-    if ext not in ALLOWED:
-        return Response(_error(f"Unsupported file type '{ext}'. "
-                               f"Upload parquet or csv."), status=400, mimetype="text/html")
-    # keep a single current file per extension family; clear old ones
-    for old in (_current_file(),):
-        if old and os.path.exists(old):
-            try:
-                os.remove(old)
-            except OSError:
-                pass
-    dest = os.path.join(DATA_DIR, "current" + ext)
-    f.save(dest)
-    as_of = request.values.get("as_of", "").strip()
-    return redirect(f"/?as_of={as_of}" if as_of else "/")
+def _d(x):
+    if not x:
+        return None
+    s = str(x).strip().replace("T", " ")
+    if not s or s.lower() in ("nan", "none", "null"):
+        return None
+    head = s[:10]                       # date portion, drop any time
+    try:
+        return dt.date.fromisoformat(head)   # handles YYYY-MM-DD
+    except ValueError:
+        pass
+    for fmt in ("%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%d %b %Y"):
+        try:
+            return dt.datetime.strptime(head, fmt).date()
+        except ValueError:
+            continue
+    return None
 
 
-@app.get("/download")
-def download():
-    path = _current_file()
-    if not path:
-        return redirect("/")
-    return send_file(path, as_attachment=True, download_name=os.path.basename(path))
+def load_rows(path):
+    rows = []
+    with open(path, newline="", encoding="utf-8-sig") as fh:
+        for raw in csv.DictReader(fh):
+            r = dict(raw)
+            for c in NUM_COLS:
+                r[c] = _f(r.get(c))
+            r["_grn_date"] = _d(r.get("grn_date"))
+            rows.append(r)
+    return rows
 
 
-def _shell(title, body):
-    return (f"<!doctype html><html><head><meta charset='utf-8'>"
-            f"<meta name='viewport' content='width=device-width, initial-scale=1'>"
-            f"<title>{title}</title><style>{core.CSS.format(c=core.PAL)}</style></head>"
-            f"<body><div class='wrap'>{body}</div></body></html>")
+def _mul(a, b):
+    return None if a is None or b is None else a * b
+
+
+def _sum(vals):
+    return sum(v for v in vals if v is not None)
+
+
+# --------------------------------------------------------------- compute -----
+def compute_ctx(rows, as_of, upload_html="", data_note=""):
+    for r in rows:
+        r["po_value"] = _mul(r.get("po_quantity"), r.get("po_landing_price"))
+        r["invoice_value"] = _mul(r.get("invoice_quantity"), r.get("invoice_landing_price"))
+        r["grn_value"] = r.get("net_amount")
+        r["dn_value"] = _mul(r.get("dn_quantity"), r.get("invoice_landing_price"))
+        iq = r.get("invoice_quantity") or 0.0
+        gq = r.get("grn_quantity") or 0.0
+        dq = r.get("dn_quantity") or 0.0
+        r["qty_variance"] = iq - (gq + dq)
+        iv = r["invoice_value"] or 0.0
+        dv = r["dn_value"] or 0.0
+        r["net_payable"] = iv - dv
+        r["is_discrepant"] = abs(r["qty_variance"]) > R.TOL
+
+    n_lines = len(rows)
+    sources = sorted({(r.get("source") or "").strip() for r in rows if r.get("source")})
+    grn_dates = [r["_grn_date"] for r in rows if r["_grn_date"]]
+    gmin = min(grn_dates) if grn_dates else None
+    gmax = max(grn_dates) if grn_dates else None
+
+    # invoice rollup
+    inv = {}
+    for r in rows:
+        k = r.get("invoice_id")
+        it = inv.get(k)
+        if it is None:
+            it = inv[k] = dict(
+                vendor=r.get("vendor_name") or "", city=r.get("city_name") or "",
+                po_value=0.0, invoice_value=0.0, grn_value=0.0, dn_value=0.0,
+                net_payable=0.0, dn_qty=0.0, qty_var_abs=0.0, disc_lines=0,
+                grn_date=None, payment=r.get("total_payment_value"))
+        it["po_value"] += r["po_value"] or 0.0
+        it["invoice_value"] += r["invoice_value"] or 0.0
+        it["grn_value"] += r["grn_value"] or 0.0
+        it["dn_value"] += r["dn_value"] or 0.0
+        it["net_payable"] += r["net_payable"] or 0.0
+        it["dn_qty"] += r.get("dn_quantity") or 0.0
+        it["qty_var_abs"] += abs(r["qty_variance"])
+        it["disc_lines"] += 1 if r["is_discrepant"] else 0
+        if r["_grn_date"] and (it["grn_date"] is None or r["_grn_date"] > it["grn_date"]):
+            it["grn_date"] = r["_grn_date"]
+        if it["payment"] is None and r.get("total_payment_value") is not None:
+            it["payment"] = r.get("total_payment_value")
+
+    for it in inv.values():
+        it["has_payment"] = it["payment"] is not None and it["payment"] > 0
+        it["has_concern"] = it["qty_var_abs"] > R.TOL
+        it["due_date"] = it["grn_date"] + dt.timedelta(days=R.CREDIT_DAYS) if it["grn_date"] else None
+        if it["due_date"]:
+            it["days_overdue"] = max(0, (as_of - it["due_date"]).days)
+            it["overdue"] = (not it["has_payment"]) and as_of > it["due_date"]
+        else:
+            it["days_overdue"], it["overdue"] = 0, False
+        if it["has_payment"]:
+            it["bucket"] = "Paid – qty variance" if it["has_concern"] else "Paid – clean"
+            it["aging"] = "Paid"
+        else:
+            it["bucket"] = "Due – open concern" if it["has_concern"] else "Due – clean (release)"
+            it["aging"] = R.aging_bucket(it["days_overdue"])
+
+    invs = list(inv.values())
+    n_inv = len(invs)
+
+    bucket_counts = {b: 0 for b in R.BUCKET_ORDER}
+    bucket_vals = {b: 0.0 for b in R.BUCKET_ORDER}
+    for it in invs:
+        bucket_counts[it["bucket"]] += 1
+        bucket_vals[it["bucket"]] += it["net_payable"]
+
+    due = [it for it in invs if not it["has_payment"]]
+    aging_counts = {b: 0 for b in R.AGING_ORDER}
+    aging_vals = {b: 0.0 for b in R.AGING_ORDER}
+    for it in due:
+        aging_counts[it["aging"]] += 1
+        aging_vals[it["aging"]] += it["net_payable"]
+
+    # discrepancy rows (top 30 by variance value)
+    disc = [r for r in rows if r["is_discrepant"]]
+    for r in disc:
+        short = r["qty_variance"] > 0
+        price = r.get("invoice_landing_price") if short else r.get("grn_landing_price")
+        r["_var_value"] = abs(r["qty_variance"]) * (price or 0.0)
+    disc.sort(key=lambda r: r["_var_value"], reverse=True)
+    disc_rows = [[
+        R.esc(r.get("invoice_id")), R.esc(r.get("po_number")), R.esc(r.get("city_name")),
+        R.esc((r.get("item_name") or "")[:36]),
+        R.num(r.get("invoice_quantity")), R.num(r.get("grn_quantity")), R.num(r.get("dn_quantity")),
+        f'{r["qty_variance"]:,.0f}', R.tag_type(r["qty_variance"] > 0), R.rupees(r["_var_value"]),
+    ] for r in disc[:30]]
+
+    def due_rows(items):
+        items = sorted(items, key=lambda it: (it["overdue"], it["net_payable"]), reverse=True)
+        return [[R.esc(k_by_val(inv, it)), R.esc(it["vendor"]), R.esc(it["city"]),
+                 R.cr(it["net_payable"]), _fmt_date(it["due_date"]),
+                 R.tag_overdue(it["overdue"], it["days_overdue"])] for it in items[:30]]
+
+    due_clean_rows = due_rows([it for it in due if not it["has_concern"]])
+    due_concern_rows = due_rows([it for it in due if it["has_concern"]])
+
+    # by city / vendor
+    city_rows = _group_rows(rows, "city_name",
+                            ["po_value", "invoice_value", "grn_value", "dn_value", "net_payable"])
+    vendor_rows = _vendor_rows(rows)
+
+    return dict(
+        sources=", ".join(sources), date_range=f"{_fmt_date(gmin)} – {_fmt_date(gmax)}",
+        n_inv=n_inv, n_lines=n_lines, as_of_str=as_of.strftime("%Y-%m-%d"),
+        data_note=data_note, upload_html=upload_html,
+        gpos_absent=("GPOS" not in sources),
+        po_v=_sum(r["po_value"] for r in rows), inv_v=_sum(r["invoice_value"] for r in rows),
+        grn_v=_sum(r["grn_value"] for r in rows), dn_v=_sum(r["dn_value"] for r in rows),
+        npay_v=_sum(r["net_payable"] for r in rows),
+        pay_v=_sum(it["payment"] for it in invs if it["has_payment"]),
+        n_dn_lines=sum(1 for r in rows if (r.get("dn_quantity") or 0) > R.TOL),
+        bucket_counts=bucket_counts, bucket_vals=bucket_vals,
+        aging_counts=aging_counts, aging_vals=aging_vals,
+        n_disc=len(disc),
+        short_u=_sum(r["qty_variance"] for r in rows if r["qty_variance"] > R.TOL),
+        excess_u=-_sum(r["qty_variance"] for r in rows if r["qty_variance"] < -R.TOL),
+        disc_rows=disc_rows,
+        n_due=len(due), n_overdue=sum(1 for it in due if it["overdue"]),
+        overdue_val=_sum(it["net_payable"] for it in due if it["overdue"]),
+        n_clean=sum(1 for it in due if not it["has_concern"]),
+        n_concern=sum(1 for it in due if it["has_concern"]),
+        due_clean_rows=due_clean_rows, due_concern_rows=due_concern_rows,
+        city_rows=city_rows, vendor_rows=vendor_rows,
+    )
+
+
+def k_by_val(inv, target):
+    for k, v in inv.items():
+        if v is target:
+            return k
+    return ""
+
+
+def _fmt_date(d):
+    return "—" if d is None else d.strftime("%d %b %Y")
+
+
+def _group_rows(rows, key, valcols, top=20):
+    agg = {}
+    for r in rows:
+        k = r.get(key) or ""
+        a = agg.setdefault(k, dict.fromkeys(valcols, 0.0))
+        a.setdefault("_disc", 0)
+        for c in valcols:
+            a[c] += r.get(c) or 0.0
+        a["_disc"] += 1 if r["is_discrepant"] else 0
+    items = sorted(agg.items(), key=lambda kv: kv[1]["net_payable"], reverse=True)[:top]
+    return [[R.esc(k), R.cr(a["po_value"]), R.cr(a["invoice_value"]), R.cr(a["grn_value"]),
+             R.cr(a["dn_value"]), R.cr(a["net_payable"]), f'{a["_disc"]}'] for k, a in items]
+
+
+def _vendor_rows(rows, top=20):
+    agg = {}
+    for r in rows:
+        k = r.get("vendor_name") or ""
+        a = agg.setdefault(k, dict(net=0.0, dn=0.0, disc=0, invs=set()))
+        a["net"] += r.get("net_payable") or 0.0
+        a["dn"] += r.get("dn_value") or 0.0
+        a["disc"] += 1 if r["is_discrepant"] else 0
+        a["invs"].add(r.get("invoice_id"))
+    items = sorted(agg.items(), key=lambda kv: kv[1]["net"], reverse=True)[:top]
+    return [[R.esc(k[:52]), f'{len(a["invs"])}', R.cr(a["net"]), R.cr(a["dn"]), f'{a["disc"]}']
+            for k, a in items]
+
+
+# --------------------------------------------------------------- server ------
+def _upload_bar(loaded, as_of_str):
+    cur = (f'<span style="color:var(--muted)">Loaded: <b style="color:var(--ink)">{R.esc(loaded)}</b></span>'
+           if loaded else '<span style="color:var(--muted)">No file loaded yet.</span>')
+    dl = '<a class="btn ghost" href="/download">Download source</a>' if loaded else ""
+    return (f'<div class="uploadbar">'
+            f'<form method="post" action="/upload" enctype="multipart/form-data">'
+            f'<input type="file" name="file" accept=".csv,.txt" required>'
+            f'<input type="date" name="as_of" value="{as_of_str}" title="As-of date for overdue calc">'
+            f'<button class="btn" type="submit">Upload &amp; analyse</button></form>'
+            f'<form method="get" action="/"><input type="hidden" name="_" value="1">'
+            f'<button class="btn ghost" type="submit">Refresh</button></form>{dl}{cur}</div>')
 
 
 def _landing(bar):
-    return _shell("Amul Reconciliation Dashboard", f"""
+    return R.shell("Amul Reconciliation Dashboard", f"""
 <h1>Amul Reconciliation Dashboard</h1>
-<p class="sub">Upload a consolidated extract (parquet or csv) to see the analysis:
- PO vs payments &amp; DNs, GRN+DN≠invoice discrepancies, payments due, and payables
- aging on Amul's <b>{core.CREDIT_DAYS}-day</b> credit term.</p>
+<p class="sub">Upload the consolidated <b>CSV</b> export to see the analysis: PO vs payments
+ &amp; DNs, GRN+DN≠invoice discrepancies, payments due, and payables aging on Amul's
+ <b>{R.CREDIT_DAYS}-day</b> credit term.</p>
 {bar}
 <div class="banner"><b>Expected file</b><ul>
- <li>The consolidated file from the notebook (<code>amul_invoice_extract.parquet</code>)
-  or its CSV — same columns: <code>source, invoice_id, po_number, grn_date,
-  invoice_quantity, grn_quantity, dn_quantity, invoice_landing_price,
-  grn_landing_price, net_amount, total_payment_value, vendor_name, city_name…</code></li>
- <li>The uploaded file is kept so the dashboard persists across refreshes
-  (until the app restarts).</li>
+ <li>The notebook's CSV export (<code>amul_invoice_extract.csv</code>) — columns:
+  <code>source, invoice_id, po_number, grn_date, invoice_quantity, grn_quantity,
+  dn_quantity, invoice_landing_price, grn_landing_price, net_amount,
+  total_payment_value, vendor_name, city_name…</code></li>
+ <li>Parquet isn't supported here (needs pyarrow, which the build environment can't
+  install); export CSV from the notebook. The upload persists across refreshes until
+  the app restarts.</li>
 </ul></div>""")
 
 
-def _error(tb):
-    return _shell("Error", f"""
-<h1>Could not render</h1>
-<div class="banner"><b>The uploaded file could not be analysed.</b>
- <p class="hint">Check it matches the expected columns. Details below.</p></div>
-<pre style="white-space:pre-wrap;font-size:12px;background:var(--surface);
- border:1px solid var(--border);border-radius:10px;padding:14px;overflow:auto">{core.esc(tb)}</pre>
-<p><a class="btn" href="/">Back</a></p>""")
+def _err(msg):
+    return R.shell("Error", f'<h1>Could not render</h1>'
+                   f'<div class="banner"><b>The uploaded file could not be analysed.</b>'
+                   f'<p class="hint">Check it is the CSV export with the expected columns.</p></div>'
+                   f'<pre style="white-space:pre-wrap;font-size:12px;background:var(--surface);'
+                   f'border:1px solid var(--border);border-radius:10px;padding:14px;overflow:auto">'
+                   f'{R.esc(msg)}</pre><p><a class="btn" href="/">Back</a></p>')
+
+
+def _as_of(qs):
+    raw = (qs.get("as_of", [""])[0] or "").strip()
+    if raw:
+        try:
+            return dt.date.fromisoformat(raw[:10])
+        except ValueError:
+            pass
+    return dt.date.today()
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "amul-recon/1.0"
+
+    def _send(self, body, status=200, ctype="text/html; charset=utf-8"):
+        data = body.encode("utf-8") if isinstance(body, str) else body
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        u = urlparse(self.path)
+        qs = parse_qs(u.query)
+        if u.path == "/health":
+            return self._send('{"ok": true}', ctype="application/json")
+        if u.path == "/download":
+            if os.path.exists(CURRENT):
+                with open(CURRENT, "rb") as fh:
+                    data = fh.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/csv")
+                self.send_header("Content-Disposition",
+                                 "attachment; filename=amul_invoice_extract.csv")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            return self._send("", status=302, ctype="text/plain")
+        if u.path != "/":
+            return self._send("Not found", status=404, ctype="text/plain")
+
+        as_of = _as_of(qs)
+        as_of_str = as_of.strftime("%Y-%m-%d")
+        if not os.path.exists(CURRENT):
+            return self._send(_landing(_upload_bar(None, as_of_str)))
+        try:
+            rows = load_rows(CURRENT)
+            ctx = compute_ctx(rows, as_of, upload_html=_upload_bar("current.csv", as_of_str),
+                              data_note="file: current.csv")
+            return self._send(R.assemble(ctx))
+        except Exception as e:  # noqa: BLE001
+            import traceback
+            return self._send(_err(traceback.format_exc() or str(e)), status=500)
+
+    def do_POST(self):
+        u = urlparse(self.path)
+        if u.path != "/upload":
+            return self._send("Not found", status=404, ctype="text/plain")
+        length = int(self.headers.get("Content-Length", "0"))
+        if length > MAX_BYTES:
+            return self._send(_err("File too large."), status=413)
+        ctype = self.headers.get("Content-Type", "")
+        env = {"REQUEST_METHOD": "POST", "CONTENT_TYPE": ctype,
+               "CONTENT_LENGTH": str(length)}
+        form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ=env,
+                                keep_blank_values=True)
+        as_of = form.getvalue("as_of", "")
+        if "file" not in form:
+            return self._send("", status=302)
+        item = form["file"]
+        fname = getattr(item, "filename", "") or ""
+        ext = os.path.splitext(fname)[1].lower()
+        if ext not in (".csv", ".txt"):
+            return self._send(_err(f"Unsupported file type '{ext}'. Upload the CSV export."),
+                              status=400)
+        with open(CURRENT, "wb") as out:
+            out.write(item.file.read())
+        self.send_response(303)
+        self.send_header("Location", f"/?as_of={as_of}" if as_of else "/")
+        self.end_headers()
+
+    def log_message(self, *a):  # quieter logs
+        pass
+
+
+def main():
+    port = int(os.environ.get("PORT", "8080"))
+    ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
+    main()
