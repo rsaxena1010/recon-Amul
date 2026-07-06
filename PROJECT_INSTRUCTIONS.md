@@ -83,3 +83,6 @@ If either query's `SELECT` columns change, update `COLUMN_ORDER` and the
 
 - 2026-07-06 — Initial notebook + this instructions file (two-query → one consolidated
   Parquet, previews, consolidated sample, quality report).
+- 2026-07-06 — `OUT_DIR` now auto-selects a writable dir (`~/amul_recon`, else
+  `./amul_recon`); `/home/Documents` was read-only in the runtime and raised
+  `PermissionError`. Override `OUT_DIR` in the CONFIG cell for a custom path.
