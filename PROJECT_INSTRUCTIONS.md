@@ -24,8 +24,14 @@ Both feed **one consolidated Parquet file** (with a matching optional CSV).
 - **Date range at the top as variables** — replaced into the queries wherever needed.
   - HPTech uses `GRN_FROM` / `GRN_TO`  → placeholders `{{GRN from}}` / `{{GRN to}}`
   - GPOS uses `START_DATE` / `END_DATE` → placeholders `{{start_date}}` / `{{end_date}}`
-- **Handle huge data**: chunked SQL reads streamed straight to Parquet; data is never fully
-  held in memory. Tune with `CHUNKSIZE`.
+- **Handle huge data**: two independent controls — (1) `BATCH_DAYS` splits each query into
+  N-day date windows run one at a time (avoids Trino `EXCEEDED_GLOBAL_MEMORY_LIMIT`, since
+  `chunksize` only chunks the *fetch*, not server-side execution); (2) `CHUNKSIZE` streams
+  each window's fetch to Parquet so memory stays bounded. All windows append to ONE file.
+  - **GPOS boundary note:** each window substitutes the same dates into `updated_at` and
+    `grn_date` filters. A row whose approval (`updated_at`) and `grn_date` fall in different
+    windows can be missed at a boundary. Weekly windows make this negligible for Amul (fast
+    approval); lower `BATCH_DAYS` = more boundaries, so don't go smaller than needed.
 - **One consolidated Parquet file** for both HPTech and GPOS transactions (a `source` column
   tags each row's origin).
 - **Show both queries** (rendered SQL is printed) **and a data sample of each**.
@@ -113,9 +119,10 @@ section 12 calls `build(OUT_FILE, DASH_FILE)`. Sections:
 - **Pure standard library — no pip.** The build cluster's pip proxy is broken
   (package downloads time out; index host malformed with `%20`), so ANY `pip install`
   fails. The deployable therefore uses only CPython stdlib:
-  - `web/app.py` — `http.server` + `csv` (no Flask/pandas). Upload the **CSV** export,
-    dashboard renders; last upload persists (emptyDir) until pod restart. `?as_of=`
-    drives the overdue calc.
+  - `web/app.py` — `http.server` + `csv` (no Flask/pandas). Upload **CSV or Parquet**
+    (parquet parsed in-browser via hyparquet, converted to CSV before upload); last upload
+    persists (emptyDir) until pod restart. Controls: **Period From–To** filters the analysed
+    rows by `grn_date` (defaults to the file's full range); **As of** drives the overdue calc.
   - `web/render.py` — dependency-free presentation (SVG/tables/page), shared with the
     notebook path.
   - `web/dashboard_core.py` — pandas compute for the notebook static export; delegates

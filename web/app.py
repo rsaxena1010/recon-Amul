@@ -252,19 +252,31 @@ def _vendor_rows(rows, top=20):
 
 
 # --------------------------------------------------------------- server ------
-def _upload_bar(loaded, as_of_str):
+def _upload_bar(loaded, as_of_str, pfrom="", pto="", dmin="", dmax=""):
     cur = (f'<span style="color:var(--muted)">Loaded: <b style="color:var(--ink)">{R.esc(loaded)}</b></span>'
            if loaded else '<span style="color:var(--muted)">No file loaded yet.</span>')
     dl = '<a class="btn ghost" href="/download">Download source</a>' if loaded else ""
-    return (f'<div class="uploadbar">'
-            f'<form id="upForm" method="post" action="/upload" enctype="multipart/form-data">'
-            f'<input id="upFile" type="file" name="file" accept=".csv,.txt,.parquet,.pq" required>'
+    upload = (f'<div class="uploadbar">'
+              f'<form id="upForm" method="post" action="/upload" enctype="multipart/form-data">'
+              f'<input id="upFile" type="file" name="file" accept=".csv,.txt,.parquet,.pq" required>'
+              f'<button class="btn" type="submit">Upload &amp; analyse</button></form>'
+              f'<form method="get" action="/"><button class="btn ghost" type="submit">Refresh</button></form>'
+              f'{dl}{cur}<span id="upMsg" style="color:var(--muted)"></span></div>')
+    filt = ""
+    if loaded:
+        rng = f"file covers {dmin} … {dmax}" if dmin else ""
+        filt = (
+            f'<form class="filterbar" method="get" action="/">'
+            f'<span class="flabel">Period</span>'
+            f'<input type="date" name="pfrom" value="{pfrom}" min="{dmin}" max="{dmax}" title="Analyse from (grn_date)">'
+            f'<span class="flabel">–</span>'
+            f'<input type="date" name="pto" value="{pto}" min="{dmin}" max="{dmax}" title="Analyse to (grn_date)">'
+            f'<span class="flabel">As&nbsp;of</span>'
             f'<input id="upAsOf" type="date" name="as_of" value="{as_of_str}" title="As-of date for overdue calc">'
-            f'<button class="btn" type="submit">Upload &amp; analyse</button></form>'
-            f'<form method="get" action="/"><input type="hidden" name="_" value="1">'
-            f'<button class="btn ghost" type="submit">Refresh</button></form>{dl}{cur}'
-            f'<span id="upMsg" style="color:var(--muted)"></span></div>'
-            f'{_CONVERT_JS}')
+            f'<button class="btn" type="submit">Apply filter</button>'
+            f'<a class="btn ghost" href="/?as_of={as_of_str}">Reset period</a>'
+            f'<span style="color:var(--muted)">{rng}</span></form>')
+    return upload + filt + _CONVERT_JS
 
 
 # Browser-side: if a .parquet file is chosen, parse it (pure-JS hyparquet) and
@@ -276,6 +288,7 @@ _CONVERT_JS = """
 (function(){
   var form=document.getElementById('upForm'); if(!form) return;
   var fileEl=document.getElementById('upFile'), msg=document.getElementById('upMsg');
+  function asOf(){var el=document.getElementById('upAsOf');return el?el.value:'';}
   function toCSV(rows){
     if(!rows.length) return '';
     var cols=Object.keys(rows[0]);
@@ -313,11 +326,11 @@ _CONVERT_JS = """
         var csv=toCSV(rows);
         var fd=new FormData();
         fd.append('file', new Blob([csv],{type:'text/csv'}), 'converted.csv');
-        fd.append('as_of', document.getElementById('upAsOf').value||'');
+        fd.append('as_of', asOf());
         msg.textContent='Uploading '+rows.length.toLocaleString()+' rows…';
         return fetch('/upload',{method:'POST',body:fd});
       })
-      .then(function(){window.location.assign('/?as_of='+encodeURIComponent(document.getElementById('upAsOf').value||''));})
+      .then(function(){window.location.assign('/?as_of='+encodeURIComponent(asOf()));})
       .catch(function(e){msg.textContent='Parquet error: '+e.message+' — try uploading the CSV export instead.';});
   });
 })();
@@ -359,6 +372,20 @@ def _as_of(qs):
         except ValueError:
             pass
     return dt.date.today()
+
+
+def _qdate(qs, key):
+    raw = (qs.get(key, [""])[0] or "").strip()
+    if raw:
+        try:
+            return dt.date.fromisoformat(raw[:10])
+        except ValueError:
+            pass
+    return None
+
+
+def _iso(d):
+    return d.isoformat() if d else ""
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -411,9 +438,22 @@ class Handler(BaseHTTPRequestHandler):
         if not os.path.exists(CURRENT):
             return self._send(_landing(_upload_bar(None, as_of_str)))
         try:
-            rows = load_rows(CURRENT)
-            ctx = compute_ctx(rows, as_of, upload_html=_upload_bar("current.csv", as_of_str),
-                              data_note="file: current.csv")
+            rows_all = load_rows(CURRENT)
+            gd = [r["_grn_date"] for r in rows_all if r["_grn_date"]]
+            dmin, dmax = (min(gd), max(gd)) if gd else (None, None)
+            pfrom = _qdate(qs, "pfrom") or dmin
+            pto = _qdate(qs, "pto") or dmax
+            # apply period filter on grn_date when it narrows the full range
+            if pfrom and pto and (pfrom, pto) != (dmin, dmax):
+                rows = [r for r in rows_all
+                        if r["_grn_date"] and pfrom <= r["_grn_date"] <= pto]
+                note = f"file: current.csv · period {_iso(pfrom)} → {_iso(pto)}"
+            else:
+                rows = rows_all
+                note = "file: current.csv"
+            bar = _upload_bar("current.csv", as_of_str, _iso(pfrom), _iso(pto),
+                              _iso(dmin), _iso(dmax))
+            ctx = compute_ctx(rows, as_of, upload_html=bar, data_note=note)
             return self._send(R.assemble(ctx))
         except Exception as e:  # noqa: BLE001
             import traceback

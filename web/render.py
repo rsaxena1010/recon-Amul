@@ -246,6 +246,12 @@ h2 {{ font-size:16px; margin:0 0 4px; }} h3 {{ font-size:13.5px; margin:0 0 8px;
 .uploadbar input[type=file] {{ font-size:13px; }}
 .uploadbar input[type=date] {{ padding:6px 8px; border:1px solid var(--axis);
   border-radius:8px; background:var(--surface); color:var(--ink); }}
+.filterbar {{ display:flex; flex-wrap:wrap; gap:10px; align-items:center;
+  background:var(--surface); border:1px solid var(--border); border-radius:12px;
+  padding:12px 18px; margin:0 0 14px; }}
+.filterbar input[type=date] {{ padding:6px 8px; border:1px solid var(--axis);
+  border-radius:8px; background:var(--surface); color:var(--ink); }}
+.filterbar .flabel {{ color:var(--muted); font-size:12.5px; }}
 .btn {{ background:{c[blue]}; color:#fff; border:0; border-radius:8px; padding:8px 16px;
   font-weight:600; cursor:pointer; font-size:13px; text-decoration:none; }}
 .btn.ghost {{ background:transparent; color:{c[blue]}; border:1px solid {c[blue]}; }}
