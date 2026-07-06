@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: amul-recon
+  labels:
+    app: amul-recon
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # single writable /data volume; avoid two pods diverging
+  selector:
+    matchLabels:
+      app: amul-recon
+  template:
+    metadata:
+      labels:
+        app: amul-recon
+    spec:
+      containers:
+        - name: web
+          image: 501578625374.dkr.ecr.ap-south-1.amazonaws.com/chef/blinkit-apps-saxena-rahul/amul-recon/web
+          ports:
+            - containerPort: 8080
+          env:
+            - name: DATA_DIR
+              value: /data
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: amul-recon
+  labels:
+    app: amul-recon
+spec:
+  selector:
+    app: amul-recon
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
