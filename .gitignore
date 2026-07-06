@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+.write_test
+amul_recon/
