@@ -22,6 +22,7 @@ DATA_DIR = os.environ.get("DATA_DIR", "/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 CURRENT = os.path.join(DATA_DIR, "current.csv")
 MAX_BYTES = 400 * 1024 * 1024
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
 NUM_COLS = ("po_quantity", "po_landing_price", "invoice_quantity",
             "invoice_landing_price", "grn_quantity", "grn_landing_price",
@@ -256,29 +257,77 @@ def _upload_bar(loaded, as_of_str):
            if loaded else '<span style="color:var(--muted)">No file loaded yet.</span>')
     dl = '<a class="btn ghost" href="/download">Download source</a>' if loaded else ""
     return (f'<div class="uploadbar">'
-            f'<form method="post" action="/upload" enctype="multipart/form-data">'
-            f'<input type="file" name="file" accept=".csv,.txt" required>'
-            f'<input type="date" name="as_of" value="{as_of_str}" title="As-of date for overdue calc">'
+            f'<form id="upForm" method="post" action="/upload" enctype="multipart/form-data">'
+            f'<input id="upFile" type="file" name="file" accept=".csv,.txt,.parquet,.pq" required>'
+            f'<input id="upAsOf" type="date" name="as_of" value="{as_of_str}" title="As-of date for overdue calc">'
             f'<button class="btn" type="submit">Upload &amp; analyse</button></form>'
             f'<form method="get" action="/"><input type="hidden" name="_" value="1">'
-            f'<button class="btn ghost" type="submit">Refresh</button></form>{dl}{cur}</div>')
+            f'<button class="btn ghost" type="submit">Refresh</button></form>{dl}{cur}'
+            f'<span id="upMsg" style="color:var(--muted)"></span></div>'
+            f'{_CONVERT_JS}')
+
+
+# Browser-side: if a .parquet file is chosen, parse it with the vendored hyparquet
+# bundle and convert to CSV before upload (the server is pure-stdlib and can't read
+# parquet). CSV files upload unchanged.
+_CONVERT_JS = """
+<script src="/static/parquet.min.js"></script>
+<script>
+(function(){
+  var form=document.getElementById('upForm'); if(!form) return;
+  var fileEl=document.getElementById('upFile'), msg=document.getElementById('upMsg');
+  function toCSV(rows){
+    if(!rows.length) return '';
+    var cols=Object.keys(rows[0]);
+    function esc(v){
+      if(v===null||v===undefined) return '';
+      if(v instanceof Date) v=v.toISOString();
+      else if(typeof v==='bigint') v=v.toString();
+      else v=String(v);
+      return /[",\\n]/.test(v) ? '"'+v.replace(/"/g,'""')+'"' : v;
+    }
+    var out=[cols.join(',')];
+    for(var i=0;i<rows.length;i++){var r=rows[i],line=[];for(var j=0;j<cols.length;j++)line.push(esc(r[cols[j]]));out.push(line.join(','));}
+    return out.join('\\n');
+  }
+  form.addEventListener('submit', function(ev){
+    var f=fileEl.files[0]; if(!f) return;
+    var name=f.name.toLowerCase();
+    if(!(name.endsWith('.parquet')||name.endsWith('.pq'))) return;  // CSV: normal submit
+    ev.preventDefault();
+    msg.textContent='Converting parquet…';
+    f.arrayBuffer().then(function(ab){
+      return HyParquet.parquetReadObjects({file:ab});
+    }).then(function(rows){
+      var csv=toCSV(rows);
+      var fd=new FormData();
+      fd.append('file', new Blob([csv],{type:'text/csv'}), 'converted.csv');
+      fd.append('as_of', document.getElementById('upAsOf').value||'');
+      msg.textContent='Uploading '+rows.length.toLocaleString()+' rows…';
+      return fetch('/upload',{method:'POST',body:fd});
+    }).then(function(){
+      window.location.assign('/?as_of='+encodeURIComponent(document.getElementById('upAsOf').value||''));
+    }).catch(function(e){ msg.textContent='Parquet error: '+e.message; });
+  });
+})();
+</script>
+"""
 
 
 def _landing(bar):
     return R.shell("Amul Reconciliation Dashboard", f"""
 <h1>Amul Reconciliation Dashboard</h1>
-<p class="sub">Upload the consolidated <b>CSV</b> export to see the analysis: PO vs payments
- &amp; DNs, GRN+DN≠invoice discrepancies, payments due, and payables aging on Amul's
- <b>{R.CREDIT_DAYS}-day</b> credit term.</p>
+<p class="sub">Upload the consolidated <b>CSV or Parquet</b> file to see the analysis: PO vs
+ payments &amp; DNs, GRN+DN≠invoice discrepancies, payments due, and payables aging on
+ Amul's <b>{R.CREDIT_DAYS}-day</b> credit term.</p>
 {bar}
 <div class="banner"><b>Expected file</b><ul>
- <li>The notebook's CSV export (<code>amul_invoice_extract.csv</code>) — columns:
-  <code>source, invoice_id, po_number, grn_date, invoice_quantity, grn_quantity,
-  dn_quantity, invoice_landing_price, grn_landing_price, net_amount,
-  total_payment_value, vendor_name, city_name…</code></li>
- <li>Parquet isn't supported here (needs pyarrow, which the build environment can't
-  install); export CSV from the notebook. The upload persists across refreshes until
-  the app restarts.</li>
+ <li>The notebook's consolidated output — <code>amul_invoice_extract.parquet</code> or
+  <code>.csv</code>. Columns: <code>source, invoice_id, po_number, grn_date,
+  invoice_quantity, grn_quantity, dn_quantity, invoice_landing_price, grn_landing_price,
+  net_amount, total_payment_value, vendor_name, city_name…</code></li>
+ <li>Parquet is parsed in your browser and converted to CSV before upload (the server is
+  pure-stdlib). The upload persists across refreshes until the app restarts.</li>
 </ul></div>""")
 
 
@@ -317,6 +366,19 @@ class Handler(BaseHTTPRequestHandler):
         qs = parse_qs(u.query)
         if u.path == "/health":
             return self._send('{"ok": true}', ctype="application/json")
+        if u.path == "/static/parquet.min.js":
+            fp = os.path.join(STATIC_DIR, "parquet.min.js")
+            if os.path.exists(fp):
+                with open(fp, "rb") as fh:
+                    data = fh.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/javascript; charset=utf-8")
+                self.send_header("Cache-Control", "public, max-age=86400")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            return self._send("Not found", status=404, ctype="text/plain")
         if u.path == "/download":
             if os.path.exists(CURRENT):
                 with open(CURRENT, "rb") as fh:
@@ -365,8 +427,10 @@ class Handler(BaseHTTPRequestHandler):
         fname = getattr(item, "filename", "") or ""
         ext = os.path.splitext(fname)[1].lower()
         if ext not in (".csv", ".txt"):
-            return self._send(_err(f"Unsupported file type '{ext}'. Upload the CSV export."),
-                              status=400)
+            return self._send(_err(
+                f"Received a '{ext}' file directly. Parquet is converted to CSV in the "
+                f"browser before upload — enable JavaScript, or upload the CSV export."),
+                status=400)
         with open(CURRENT, "wb") as out:
             out.write(item.file.read())
         self.send_response(303)
