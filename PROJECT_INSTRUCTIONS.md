@@ -74,6 +74,36 @@ The two queries return **different** columns, reconciled into one pinned target 
 If either query's `SELECT` columns change, update `COLUMN_ORDER` and the
 `STRING_COLS` / `NUM_COLS` / `DATE_COLS` / `TS_COLS` lists accordingly.
 
+## Dashboard (`build_dashboard.py`)
+
+Self-contained offline HTML dashboard generated from the consolidated parquet
+(inline SVG, no external JS/CSS — respects the no-external-content policy). Notebook
+section 12 calls `build(OUT_FILE, DASH_FILE)`. Sections:
+
+- **PO value vs Invoice / GRN / DN / Net payable** (value flow).
+- **Payment status by invoice**: Paid–clean, Paid–qty variance, Due–clean (release),
+  Due–open concern.
+- **Quantity discrepancies**: lines where `invoice_qty ≠ grn_qty + dn_qty`.
+- **Payments due**: clean (release) vs held (open concern).
+- **By city / by vendor** summaries.
+
+### Reconciliation definitions (agreed)
+- PO value = `po_quantity × po_landing_price`
+- Invoice value = `invoice_quantity × invoice_landing_price`
+- GRN value = `net_amount` (`grn_quantity × grn_landing_price`)
+- DN value = `dn_quantity × invoice_landing_price`
+- Net payable = Invoice value − DN value
+- Quantity variance = `invoice_quantity − (grn_quantity + dn_quantity)`; non-zero = discrepancy
+- **Open concern** = an unresolved quantity variance (GRN+DN ≠ invoice). A DN alone is a
+  *resolution* of short supply, NOT an open concern.
+- **Paid** = a payment amount / UTR record exists for the invoice.
+
+### Known caveats baked into the dashboard banner
+- `total_payment_value` is **batch-level** (constant per invoice, repeats across line
+  items, ~8× net). Do not sum across rows or treat as an invoice settlement balance.
+- GPOS rows currently absent — dashboard reflects HPTech only until the GPOS query returns
+  data. It auto-adapts (shows both sources) once GPOS lands.
+
 ## Git
 
 - Branch: `claude/redash-data-consolidation-5mp9wu`
@@ -86,3 +116,8 @@ If either query's `SELECT` columns change, update `COLUMN_ORDER` and the
 - 2026-07-06 — `OUT_DIR` now auto-selects a writable dir (`~/amul_recon`, else
   `./amul_recon`); `/home/Documents` was read-only in the runtime and raised
   `PermissionError`. Override `OUT_DIR` in the CONFIG cell for a custom path.
+- 2026-07-06 — Added `build_dashboard.py` + notebook section 12: offline HTML
+  reconciliation dashboard (PO vs payments/DN, GRN+DN≠invoice discrepancies,
+  payments due vs held). Analysis of the June-2025 HPTech extract: PO ₹143.2 Cr,
+  Invoice ₹104.2 Cr, GRN ₹105.4 Cr, DN ₹0.66 Cr; 83 discrepant lines (all
+  excess-received); 10 invoices with no payment recorded.
